@@ -1,0 +1,11 @@
+# Ignore all build folders
+build*/
+**/build*/
+
+# Optional common firmware generated files
+*.elf
+*.hex
+*.bin
+*.map
+*.lst
+*.log
