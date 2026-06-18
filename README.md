@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-This repository contains the firmware for an nRF52840-based research medical wristband used for physiological sensing, local storage, and BLE telemetry. The hardware platform for the wristband was developed by the HW team, and the complete firmware stack in this repository was developed by me from scratch.
+This repository contains the firmware for an nRF52840-based research medical wristband used for physiological sensing, local storage, and BLE telemetry. The hardware platform for the wristband was developed by the HW team, and the complete firmware stack in this repository was developed by me from scratch for learning purpose.
 
 The device is designed to:
 
