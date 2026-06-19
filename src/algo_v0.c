@@ -30,7 +30,7 @@ LOG_MODULE_REGISTER(algo_v0, LOG_LEVEL_INF);
 
 /* Expected sampling rates per doc (defaults) */
 #define ACC_FS_HZ_DEFAULT           32
-#define PPG_FS_HZ_DEFAULT           64
+#define PPG_FS_HZ_DEFAULT           100
 #define EDA_FS_HZ_DEFAULT           4
 #define TEMP_FS_HZ_DEFAULT          4
 

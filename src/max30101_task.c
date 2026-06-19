@@ -38,15 +38,15 @@ LOG_MODULE_REGISTER(max30101_demo, LOG_LEVEL_INF);
 #define REG_PART_ID           0xFF
 
 /*
- * MAX30101 does not support native 64 Hz sampling.
- * Keep sensor at 100 Hz and downsample in firmware to an exact effective 64 Hz
- * for both algo feed and raw-memory logging.
+ * MAX30101 is configured for native 100 Hz PPG.
+ * For wrist validation, do not downsample by dropping samples; every raw frame
+ * is pushed to Algo V0 and optionally logged. Green-only mode keeps bandwidth
+ * and NAND usage manageable.
  */
 #define PPG_SENSOR_FS_HZ          100U
 #define PPG_SENSOR_FRAME_MS       10
-#define PPG_TARGET_FS_HZ          64U
 #define PPG_LOOP_SLEEP_MS         10
-#define PPG_LOG_EVERY_N           64U
+#define PPG_LOG_EVERY_N           100U
 #define PPG_FIFO_DBG_EVERY_N      50U
 
 /* -------- Skin / wear detection tuning -------- */
@@ -276,8 +276,8 @@ static void max30101_manual_init(void)
     wr(REG_MODE_CONFIG, 0x07);
 
     /*
-     * Keep sensor at 100 Hz, 18-bit pulse width.
-     * Effective outgoing PPG rate is reduced to 64 Hz in firmware.
+     * Keep sensor at native 100 Hz, 18-bit pulse width.
+     * Algo/logging now use every available frame; no 100 -> 64 Hz dropping.
      */
     wr(REG_SPO2_CONFIG, 0x27);
 
@@ -353,21 +353,6 @@ static void log_wear_transition(bool worn,
             off_score);
 }
 
-static void advance_64hz_time(int64_t *t_ms, uint32_t *frac_us)
-{
-    /*
-     * 1000 / 64 = 15.625 ms
-     * Use integer ms + fractional accumulator:
-     * +15 ms, remainder +625 us each sample.
-     */
-    *t_ms += 15;
-    *frac_us += 625U;
-    if (*frac_us >= 1000U) {
-        *t_ms += 1;
-        *frac_us -= 1000U;
-    }
-}
-
 static void max30101_thread(void *a, void *b, void *c)
 {
     ARG_UNUSED(a);
@@ -375,7 +360,7 @@ static void max30101_thread(void *a, void *b, void *c)
     ARG_UNUSED(c);
 
     LOG_INF("=== MAX30101 REGISTER-LEVEL FIFO READ (NO ZEPHYR DRIVER) ===");
-    LOG_INF("PPG sensor=100 Hz, effective output/logging=64 Hz");
+    LOG_INF("PPG sensor=%u Hz, native output/logging=%u Hz (no firmware decimation)", PPG_SENSOR_FS_HZ, PPG_SENSOR_FS_HZ);
     LOG_INF("Wear detect: selected active PPG channel + AC envelope + AS6221 temperature with hysteresis");
 
     i2c_dev = DEVICE_DT_GET(DT_NODELABEL(i2c0));
@@ -391,15 +376,6 @@ static void max30101_thread(void *a, void *b, void *c)
     uint32_t pub_frame_count = 0U;
 
     int64_t next_raw_frame_t_ms = 0;
-    int64_t next_pub_t_ms = 0;
-    uint32_t next_pub_t_frac_us = 0U;
-
-    /*
-     * Rational downsampler from 100 Hz -> 64 Hz.
-     * Accumulator-based keep decision:
-     *   acc += 64; keep if acc >= 100; then acc -= 100.
-     */
-    uint32_t decim_acc = 0U;
 
     bool worn = false;
     int64_t on_candidate_since_ms = -1;
@@ -452,8 +428,6 @@ static void max30101_thread(void *a, void *b, void *c)
         int64_t now_ms = k_uptime_get();
         if (next_raw_frame_t_ms == 0) {
             next_raw_frame_t_ms = now_ms - ((int64_t)(available_frames - 1U) * PPG_SENSOR_FRAME_MS);
-            next_pub_t_ms = next_raw_frame_t_ms;
-            next_pub_t_frac_us = 0U;
         }
 
         for (uint8_t i = 0; i < available_frames; i++) {
@@ -569,49 +543,40 @@ static void max30101_thread(void *a, void *b, void *c)
             }
 
             /*
-             * Exact effective 64 Hz output/logging from 100 Hz raw input.
+             * Native 100 Hz output/logging: push every raw MAX30101 frame.
+             * This avoids the old 100 -> 64 Hz sample-dropping pattern and gives
+             * the GUI/peak detector uniform 10 ms PPG timing.
              */
-            decim_acc += PPG_TARGET_FS_HZ;
-            if (decim_acc >= PPG_SENSOR_FS_HZ) {
-                int64_t pub_t_ms = next_pub_t_ms;
-                decim_acc -= PPG_SENSOR_FS_HZ;
-
 #if PPG_VALIDATION_MODE
-                /* Validation mode keeps the algorithm input explicitly on real GREEN. */
-                uint32_t algo_ppg_signal = green;
-                algo_v0_push_ppg(red, ir, green, pub_t_ms);
+            /* Validation mode keeps the algorithm input explicitly on real GREEN. */
+            uint32_t algo_ppg_signal = green;
+            algo_v0_push_ppg(red, ir, green, raw_sample_t_ms);
 #else
-                /* Existing Algo V0 processes the value passed in the IR argument.
-                 * In default GREEN-only mode, feed GREEN as the selected active signal.
-                 */
-                uint32_t algo_ppg_signal = (active_mask & MAX30101_PPG_CH_IR) ? ir : green;
-                algo_v0_push_ppg(red, algo_ppg_signal, green, pub_t_ms);
+            /* Existing Algo V0 processes the value passed in the IR argument.
+             * In default GREEN-only mode, feed GREEN as the selected active signal.
+             */
+            uint32_t algo_ppg_signal = (active_mask & MAX30101_PPG_CH_IR) ? ir : green;
+            algo_v0_push_ppg(red, algo_ppg_signal, green, raw_sample_t_ms);
 #endif
 
 #if !(PPG_VALIDATION_MODE && PPG_VAL_DISABLE_NAND)
-                /* Binary NAND logging stores only active/app-enabled PPG channels. */
-                w25n01_log_raw_ppg_mask(active_mask, red, ir, green, pub_t_ms);
+            /* Binary NAND logging stores only active/app-enabled PPG channels. */
+            w25n01_log_raw_ppg_mask(active_mask, red, ir, green, raw_sample_t_ms);
 #endif
 
 #if !(PPG_VALIDATION_MODE && PPG_VAL_DISABLE_DEBUG_LOGS)
-                if ((pub_frame_count % PPG_LOG_EVERY_N) == 0U) {
-                    LOG_INF("PPG OUT | mode=%s mask=0x%02X | RED=%u | IR=%u | GREEN=%u | stored_sig=%u | t=%lld",
-                        max30101_channel_mask_name(active_mask), active_mask, red, ir, green, algo_ppg_signal, pub_t_ms);
-                }
+            if ((pub_frame_count % PPG_LOG_EVERY_N) == 0U) {
+                LOG_INF("PPG OUT | mode=%s mask=0x%02X | RED=%u | IR=%u | GREEN=%u | stored_sig=%u | t=%lld",
+                    max30101_channel_mask_name(active_mask), active_mask, red, ir, green, algo_ppg_signal, raw_sample_t_ms);
+            }
 #endif
 
-                pub_frame_count++;
-                advance_64hz_time(&next_pub_t_ms, &next_pub_t_frac_us);
-            }
-
+            pub_frame_count++;
             raw_frame_count++;
         }
 
         if (next_raw_frame_t_ms < (now_ms - 100)) {
             next_raw_frame_t_ms = now_ms;
-            next_pub_t_ms = now_ms;
-            next_pub_t_frac_us = 0U;
-            decim_acc = 0U;
         }
 
         k_msleep(PPG_LOOP_SLEEP_MS);
