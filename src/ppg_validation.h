@@ -11,7 +11,7 @@
  *
  * 0 = restore normal full firmware behavior.
  */
-#define PPG_VALIDATION_MODE        0
+#define PPG_VALIDATION_MODE        1
 
 /* Stream every N native 100 Hz PPG samples.
  * 1 = ~100 PV lines/sec, 2 = ~50 PV lines/sec, 4 = ~25 PV lines/sec.
@@ -19,6 +19,17 @@
  */
 #define PPG_VAL_STREAM_DIV         2U
 
+/* Compact GUI morphology stream.
+ * Best current setting for BLE text streaming:
+ *   PC div=4  -> compact clean PPG at ~25 Hz. This is the most stable
+ *                setting seen so far for the current BLE text path and GUI.
+ *   PV div=64 -> full diagnostics at ~1.6 Hz to keep BLE free for waveform.
+ *
+ * Internal algorithm still processes every native 100 Hz MAX30101 sample.
+ */
+#define PPG_PC_STREAM_DIV          4U
+#define PPG_PV_DEBUG_STREAM_DIV    64U
+#define PPG_VAL_LED_CURRENT       0x80U
 /*
  * Lightweight final PPG waveform stream for COMPLETE FW mode.
  *

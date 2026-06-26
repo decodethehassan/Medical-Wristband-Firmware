@@ -10,6 +10,7 @@
 #define M_PI 3.14159265358979323846f
 #endif
 #include <stdlib.h>
+#include <float.h>
 
 #if PPG_VALIDATION_MODE || PPG_FULLFW_PPG_STREAM_ENABLE
 #include "ble_log_service.h"
@@ -37,7 +38,15 @@ LOG_MODULE_REGISTER(algo_v0, LOG_LEVEL_INF);
 /* --- Artifact thresholds --- */
 #define TH_ACCEL_VAR_G2             0.02f
 #define TH_SMA_G                    0.20f
+#if PPG_VALIDATION_MODE
+/* Wrist validation needs a slightly lower SQI threshold than fingertip.
+ * The AC/DC and contact gates below still prevent obviously bad windows from
+ * being marked qok=1.
+ */
+#define TH_PPG_SQI                  0.35f
+#else
 #define TH_PPG_SQI                  0.50f
+#endif
 #define TH_CLIP_FRAC                0.05f
 
 /* MAX30101 is 18-bit raw */
@@ -67,10 +76,23 @@ LOG_MODULE_REGISTER(algo_v0, LOG_LEVEL_INF);
 #define HRV_MIN_CONT_CLEAN_SEC      20
 
 /* --- Beat detection --- */
+#if PPG_VALIDATION_MODE
+/* Wrist validation: allow normal resting HR plus slightly faster/lower edge cases.
+ * The previous 600 ms minimum and 1500 ms maximum were too restrictive while
+ * tuning wrist PPG and could cause the detector to lose its beat anchor.
+ */
+#define PEAK_REFRACTORY_MS          520
+#define IBI_MIN_MS                  520
+#define IBI_MAX_MS                  1800
+#define IBI_OUTLIER_FRAC            0.45f
+#define PPG_USE_IBI_OUTLIER_REJECT  1
+#else
 #define PEAK_REFRACTORY_MS          600
 #define IBI_MIN_MS                  600
 #define IBI_MAX_MS                  1500
 #define IBI_OUTLIER_FRAC            0.20f
+#define PPG_USE_IBI_OUTLIER_REJECT  1
+#endif
 #define IBI_MAX_PER_MIN             512
 #define IBI_MAX_PER_10S             64
 #define ACC_MIN_SAMPLES_5S          8
@@ -79,6 +101,87 @@ LOG_MODULE_REGISTER(algo_v0, LOG_LEVEL_INF);
 /* --- Contact placement / optical transient protection --- */
 #define PPG_RAW_STEP_RESET_ADC      1500.0f
 #define PPG_SETTLE_AFTER_RESET_MS   3000
+
+/* --- Wrist PPG contact stability diagnostics/gating ---
+ *
+ * Wrist PPG often fails because the sensor pressure/contact slowly changes.
+ * That creates a large raw-DC drift that can pass a simple band-power SQI and
+ * look like a false pulse.  The values below are deliberately conservative:
+ * they should catch obvious strap/contact shifts without rejecting normal
+ * small pulse AC on a still wrist.
+ */
+#define PPG_DC_RANGE_ART_ADC        450.0f
+
+/* Live recovery thresholds.
+ * PPG_DC_RANGE_ART_ADC only marks a completed 5s window as bad.  Wrist contact
+ * pressure shifts can be much faster and can poison the high-pass/threshold
+ * state for many seconds, so the live reset path below clears the filter as
+ * soon as a large raw-DC range or filtered spike is observed.
+ */
+#define PPG_LIVE_DC_RANGE_RESET_ADC 650.0f
+#define PPG_FILTER_SPIKE_RESET_ADC  180.0f
+#define PPG_ARTIFACT_RECOVERY_MS    2500
+#define PPG_LIVE_CONTACT_MIN_SAMPLES 20U
+
+#define PPG_DC_EMA_ALPHA            0.01f
+#define PPG_AC_ENV_ALPHA            0.03f
+
+/* Wrist validation tuning.
+ * PPG_PEAK_SIGMA_K controls how far above the adaptive mean a local maximum
+ * must be before it becomes a peak candidate. 0.82/0.45/0.30 were still
+ * too strict for this wrist dataset; 0.18 gives more candidates while quality
+ * gates, AC/DC, refractory, contact recovery, and IBI cleanup still suppress bad windows.
+ * PPG_PEAK_MIN_POS_ADC and PPG_PEAK_PROM_MIN_ADC prevent tiny noise bumps
+ * from becoming beats after lowering the adaptive threshold. PPG_AC_MIN_ADC and
+ * PPG_ACDC_MIN reject very weak optical pulses even when SQI alone is borderline.
+ */
+#if PPG_VALIDATION_MODE
+#define PPG_PEAK_SIGMA_K            0.18f
+#define PPG_PEAK_MIN_POS_ADC        2.0f
+#define PPG_PEAK_PROM_MIN_ADC       0.5f
+#define PPG_AC_MIN_ADC              8.0f
+#define PPG_ACDC_MIN                0.0010f
+#else
+#define PPG_PEAK_SIGMA_K            0.82f
+#define PPG_PEAK_MIN_POS_ADC        0.0f
+#define PPG_PEAK_PROM_MIN_ADC       0.0f
+#define PPG_AC_MIN_ADC              0.0f
+#define PPG_ACDC_MIN                0.0f
+#endif
+
+/* --- Clean display morphology path ---
+ * This path is intentionally separate from the beat-detection signal.
+ *
+ * filt=... remains the detector/debug waveform used for candidate/beat logic.
+ * clean=... is a display-oriented morphology waveform for the GUI. It is
+ * deliberately smoother and narrower-band so the user can inspect PPG shape
+ * similar to published clean PPG examples.
+ *
+ * Notes:
+ *   - HP 0.70 Hz removes slow strap/contact baseline wander.
+ *   - LP 2.80 Hz keeps normal wrist HR morphology while removing fast noise.
+ *   - Final 3.50 Hz smoothing reduces jagged sample-to-sample noise.
+ *   - Clamp is for display only; it prevents one artifact from dominating the
+ *     GUI y-axis. It does not change peak/HR detection.
+ */
+#define PPG_CLEAN_HP_HZ             0.70f
+#define PPG_CLEAN_LP_HZ             2.20f
+#define PPG_CLEAN_SMOOTH_HZ         2.20f
+#define PPG_CLEAN_CLAMP_ADC         100.0f
+
+/* Compact morphology stream for GUI display.
+ * PC is short and can be streamed at native rate for smooth plots.
+ * PV/PPG_STREAM remains the slower debug stream.
+ */
+#ifndef PPG_PC_STREAM_DIV
+/* Fallback: stream compact clean PPG at ~50 Hz when MAX30101 is 100 Hz. */
+#define PPG_PC_STREAM_DIV           2U
+#endif
+
+#ifndef PPG_PV_DEBUG_STREAM_DIV
+/* Fallback: stream full diagnostics slowly to protect BLE bandwidth. */
+#define PPG_PV_DEBUG_STREAM_DIV     16U
+#endif
 
 /* =========================
  * Internal state
@@ -212,10 +315,30 @@ static uint32_t  g_ppg_total_cnt_5s;
 static float     g_ppg_energy_band_5s;
 static float     g_ppg_energy_total_5s;
 
+/* Wrist/contact diagnostics for current 5s window. */
+static float     g_ppg_raw_min_5s;
+static float     g_ppg_raw_max_5s;
+static float     g_ppg_raw_sum_5s;
+static float     g_ppg_abs_filt_sum_5s;
+
+/* Live DC/AC estimates for BLE diagnostics. */
+static float     g_ppg_dc_ema;
+static float     g_ppg_ac_env;
+
+/* Last completed 5s diagnostic values shown in PV/PV_WIN. */
+static float     g_last_ppg_dc_range_live = NAN;
+static float     g_last_ppg_ac_live = NAN;
+static float     g_last_ppg_acdc_live = NAN;
+static bool      g_last_ppg_contact_artifact_live = false;
+
 /* Beat detection state on IR channel */
 static int64_t   g_last_ppg_t = -1;
 static float     g_ppg_hp;
 static float     g_ppg_lp;
+static float     g_ppg_clean_hp;
+static float     g_ppg_clean_lp;
+static float     g_ppg_clean_smooth;
+static float     g_ppg_clean_x_prev;
 static float     g_ppg_mean_ewma;
 static float     g_ppg_var_ewma;
 static float     g_ppg_x_prev;
@@ -244,6 +367,7 @@ static bool      g_last_ppg_artifact_live = true;
  */
 static float     g_ppg_last_raw = NAN;
 static int64_t   g_ppg_ignore_until_ms = 0;
+static int64_t   g_ppg_recovery_until_ms = 0;
 
 /* Store clean IBIs during the current minute, plus their end timestamps */
 static uint16_t  g_ibi_ms[IBI_MAX_PER_MIN];
@@ -341,6 +465,10 @@ static void ppg_reset_filter_state(float x, int64_t t_ms)
 {
     g_ppg_hp = 0.0f;
     g_ppg_lp = 0.0f;
+    g_ppg_clean_hp = 0.0f;
+    g_ppg_clean_lp = 0.0f;
+    g_ppg_clean_smooth = 0.0f;
+    g_ppg_clean_x_prev = x;
     g_ppg_mean_ewma = 0.0f;
     g_ppg_var_ewma = 1.0f;
     g_ppg_x_prev = x;
@@ -365,6 +493,18 @@ static void ppg_reset_filter_state(float x, int64_t t_ms)
     g_ppg_total_cnt_5s = 0;
     g_ppg_energy_band_5s = 0.0f;
     g_ppg_energy_total_5s = 0.0f;
+    g_ppg_raw_min_5s = FLT_MAX;
+    g_ppg_raw_max_5s = -FLT_MAX;
+    g_ppg_raw_sum_5s = 0.0f;
+    g_ppg_abs_filt_sum_5s = 0.0f;
+
+    /* Reset live optical diagnostics to the new contact level. */
+    g_ppg_dc_ema = x;
+    g_ppg_ac_env = 0.0f;
+    g_last_ppg_dc_range_live = NAN;
+    g_last_ppg_ac_live = NAN;
+    g_last_ppg_acdc_live = NAN;
+    g_last_ppg_contact_artifact_live = true;
 
     /* Force quality gate closed until the next clean completed window. */
     g_last_ppg_quality_ok = false;
@@ -372,6 +512,7 @@ static void ppg_reset_filter_state(float x, int64_t t_ms)
     g_last_ppg_artifact_live = true;
 
     g_ppg_ignore_until_ms = t_ms + PPG_SETTLE_AFTER_RESET_MS;
+    g_ppg_recovery_until_ms = t_ms + PPG_ARTIFACT_RECOVERY_MS;
 }
 
 #if PPG_VALIDATION_MODE || PPG_FULLFW_PPG_STREAM_ENABLE
@@ -380,50 +521,108 @@ static void ppg_stream_send_sample(int64_t t_ms,
                                    uint32_t ppg_raw,
                                    uint32_t green_raw,
                                    float filt,
+                                   float clean,
                                    float th,
                                    int peak,
                                    int32_t ibi_ms,
                                    float hr_inst,
-                                   float fs_hz)
+                                   float fs_hz,
+                                   float dc,
+                                   float dc_range,
+                                   float ac,
+                                   float acdc,
+                                   int contact_artifact,
+                                   int cand,
+                                   float prom,
+                                   float pk_amp,
+                                   int32_t cand_ibi_ms)
 {
     if (!ble_log_is_ready()) {
         return;
     }
 
+    int qok = g_last_ppg_quality_ok ? 1 : 0;
+    int art = g_last_ppg_artifact_live ? 1 : 0;
+    int settling = ((t_ms < g_ppg_ignore_until_ms) ||
+                    (t_ms < g_ppg_recovery_until_ms)) ? 1 : 0;
+
+    /*
+     * C = ultra-compact clean-PPG stream for the desktop GUI.
+     * Format:
+     *   C,t_ms,seq,green,clean,peak,qok,artifact,contact,hr,fs,sqi,acdc
+     *
+     * This avoids the long key=value text line overhead that was freezing the
+     * GUI and causing BLE burst/gap behavior.  Full PV debug lines are still
+     * sent slowly below.
+     */
+    const uint32_t pc_div = MAX((uint32_t)PPG_PC_STREAM_DIV, 1U);
+    if (((seq % pc_div) == 0U) || (peak != 0)) {
+        char pc_line[128];
+        int pc_n = snprintk(pc_line, sizeof(pc_line),
+            "C,%lld,%u,%u,%.2f,%d,%d,%d,%d,%.1f,%.1f,%.3f,%.5f\r\n",
+            t_ms,
+            seq,
+            green_raw,
+            (double)clean,
+            peak,
+            qok,
+            art,
+            contact_artifact,
+            (double)hr_inst,
+            (double)fs_hz,
+            isnan(g_last_ppg_sqi_live) ? -1.0 : (double)g_last_ppg_sqi_live,
+            isnan(acdc) ? -1.0 : (double)acdc);
+        if (pc_n > 0) {
+            (void)ble_log_send_as((const uint8_t *)pc_line, (size_t)pc_n);
+        }
+    }
+
 #if PPG_VALIDATION_MODE
-    const uint32_t stream_div = PPG_VAL_STREAM_DIV;
+    const uint32_t debug_div = MAX((uint32_t)PPG_PV_DEBUG_STREAM_DIV, 1U);
 #else
-    const uint32_t stream_div = PPG_FULLFW_PPG_STREAM_DIV;
+    const uint32_t debug_div = MAX((uint32_t)PPG_FULLFW_PPG_STREAM_DIV, 1U);
 #endif
 
-    /* Keep bandwidth manageable, but always send accepted peak samples. */
-    if (((seq % stream_div) != 0U) && (peak == 0)) {
+    /*
+     * PV/PPG_STREAM = full debug stream.  Send it much slower than PC so BLE and
+     * the desktop GUI are not overloaded.  Still send accepted peaks/contact
+     * events so debugging information is not lost.
+     */
+    if (((seq % debug_div) != 0U) && (peak == 0) && (contact_artifact == 0)) {
         return;
     }
 
-    int settling = (t_ms < g_ppg_ignore_until_ms) ? 1 : 0;
-
-    char line[320];
+    char line[512];
     int n = snprintk(line, sizeof(line),
 #if PPG_VALIDATION_MODE
-        "PV,t=%lld,seq=%u,raw=%u,green=%u,filt=%.2f,th=%.2f,peak=%d,ibi=%ld,hr=%.1f,fs=%.1f,qok=%d,sqi=%.3f,art=%d,settle=%d\r\n",
+        "PV,t=%lld,seq=%u,raw=%u,green=%u,filt=%.2f,clean=%.2f,th=%.2f,peak=%d,ibi=%ld,hr=%.1f,fs=%.1f,qok=%d,sqi=%.3f,art=%d,settle=%d,dc=%.1f,dc_rng=%.1f,ac=%.2f,acdc=%.5f,contact=%d,cand=%d,prom=%.2f,pkamp=%.2f,cibi=%ld\r\n",
 #else
-        "PPG_STREAM,t=%lld,seq=%u,raw=%u,green=%u,filt=%.2f,th=%.2f,peak=%d,ibi=%ld,hr=%.1f,fs=%.1f,qok=%d,sqi=%.3f,art=%d,settle=%d\r\n",
+        "PPG_STREAM,t=%lld,seq=%u,raw=%u,green=%u,filt=%.2f,clean=%.2f,th=%.2f,peak=%d,ibi=%ld,hr=%.1f,fs=%.1f,qok=%d,sqi=%.3f,art=%d,settle=%d,dc=%.1f,dc_rng=%.1f,ac=%.2f,acdc=%.5f,contact=%d,cand=%d,prom=%.2f,pkamp=%.2f,cibi=%ld\r\n",
 #endif
         t_ms,
         seq,
         ppg_raw,
         green_raw,
         (double)filt,
+        (double)clean,
         (double)th,
         peak,
         (long)ibi_ms,
         (double)hr_inst,
         (double)fs_hz,
-        g_last_ppg_quality_ok ? 1 : 0,
+        qok,
         isnan(g_last_ppg_sqi_live) ? -1.0 : (double)g_last_ppg_sqi_live,
-        g_last_ppg_artifact_live ? 1 : 0,
-        settling);
+        art,
+        settling,
+        (double)dc,
+        isnan(dc_range) ? -1.0 : (double)dc_range,
+        isnan(ac) ? -1.0 : (double)ac,
+        isnan(acdc) ? -1.0 : (double)acdc,
+        contact_artifact,
+        cand,
+        (double)prom,
+        (double)pk_amp,
+        (long)cand_ibi_ms);
 
     if (n > 0) {
         (void)ble_log_send_as((const uint8_t *)line, (size_t)n);
@@ -513,6 +712,21 @@ void algo_v0_push_ppg(uint32_t red, uint32_t ir, uint32_t green, int64_t t_ms)
         g_ppg_clip_cnt_5s++;
     }
 
+    float x = (float)ppg_raw;
+
+    /* Raw/DC diagnostics for wrist contact stability. */
+    if (x < g_ppg_raw_min_5s) g_ppg_raw_min_5s = x;
+    if (x > g_ppg_raw_max_5s) g_ppg_raw_max_5s = x;
+    g_ppg_raw_sum_5s += x;
+
+    if (g_ppg_dc_ema <= 0.0f || isnan(g_ppg_dc_ema)) {
+        g_ppg_dc_ema = x;
+        g_ppg_ac_env = 0.0f;
+    } else {
+        g_ppg_dc_ema += PPG_DC_EMA_ALPHA * (x - g_ppg_dc_ema);
+        g_ppg_ac_env += PPG_AC_ENV_ALPHA * (f_abs(x - g_ppg_dc_ema) - g_ppg_ac_env);
+    }
+
     if (g_last_ppg_t > 0) {
         int64_t dt_ms = t_ms - g_last_ppg_t;
         if (dt_ms > 0) {
@@ -521,8 +735,6 @@ void algo_v0_push_ppg(uint32_t red, uint32_t ir, uint32_t green, int64_t t_ms)
         }
     }
     g_last_ppg_t = t_ms;
-
-    float x = (float)ppg_raw;
 
     /* Contact-placement protection:
      * Finger/wrist contact can cause a large raw DC step. Without this reset,
@@ -541,6 +753,36 @@ void algo_v0_push_ppg(uint32_t red, uint32_t ir, uint32_t green, int64_t t_ms)
         }
     }
 
+    float live_dc_range_pre = NAN;
+    if (g_ppg_raw_min_5s != FLT_MAX && g_ppg_raw_max_5s != -FLT_MAX) {
+        live_dc_range_pre = g_ppg_raw_max_5s - g_ppg_raw_min_5s;
+    }
+
+    bool live_contact_reset =
+        (g_ppg_total_cnt_5s >= PPG_LIVE_CONTACT_MIN_SAMPLES) &&
+        !isnan(live_dc_range_pre) &&
+        (live_dc_range_pre > PPG_LIVE_DC_RANGE_RESET_ADC);
+
+    if (live_contact_reset) {
+        ppg_reset_filter_state(x, t_ms);
+        g_ppg_last_raw = x;
+
+        /* Start the new quality window with the current sample instead of
+         * waiting until the next sample, so diagnostics remain continuous.
+         */
+        g_ppg_total_cnt_5s = 1;
+        g_ppg_saturation_5s = false;
+        g_ppg_clip_cnt_5s = 0;
+        if (ppg_raw >= (PPG_ADC_MAX - PPG_SAT_EPS) || ppg_raw <= (PPG_ADC_MIN + PPG_SAT_EPS)) {
+            g_ppg_saturation_5s = true;
+            g_ppg_clip_cnt_5s = 1;
+        }
+        g_ppg_raw_min_5s = x;
+        g_ppg_raw_max_5s = x;
+        g_ppg_raw_sum_5s = x;
+        g_ppg_abs_filt_sum_5s = 0.0f;
+    }
+
     float dt = 1.0f / MAX(g_ppg_fs_hz, 10.0f);
 
     /* Band-pass approximation: HP 0.5 Hz then LP 5 Hz. */
@@ -555,9 +797,55 @@ void algo_v0_push_ppg(uint32_t red, uint32_t ir, uint32_t green, int64_t t_ms)
 
     float y = g_ppg_lp;
 
+    /* Separate clean morphology signal for GUI display.
+     * Keep this separate from y/filt so HR tuning can be adjusted without
+     * changing the waveform that is easiest to visually inspect.
+     */
+    float rc_clean_hp = 1.0f / (2.0f * (float)M_PI * PPG_CLEAN_HP_HZ);
+    float a_clean_hp = rc_clean_hp / (rc_clean_hp + dt);
+    g_ppg_clean_hp = a_clean_hp * (g_ppg_clean_hp + x - g_ppg_clean_x_prev);
+    g_ppg_clean_x_prev = x;
+
+    float rc_clean_lp = 1.0f / (2.0f * (float)M_PI * PPG_CLEAN_LP_HZ);
+    float a_clean_lp = dt / (rc_clean_lp + dt);
+    g_ppg_clean_lp = g_ppg_clean_lp + a_clean_lp * (g_ppg_clean_hp - g_ppg_clean_lp);
+
+    float rc_clean_s = 1.0f / (2.0f * (float)M_PI * PPG_CLEAN_SMOOTH_HZ);
+    float a_clean_s = dt / (rc_clean_s + dt);
+    g_ppg_clean_smooth = g_ppg_clean_smooth + a_clean_s * (g_ppg_clean_lp - g_ppg_clean_smooth);
+
+    /* GUI/display-only clamp. This keeps the clean waveform visually readable
+     * after short contact spikes while leaving detector signal y untouched.
+     */
+    float y_clean = g_ppg_clean_smooth;
+    y_clean = MIN(PPG_CLEAN_CLAMP_ADC, MAX(-PPG_CLEAN_CLAMP_ADC, y_clean));
+
+    bool filter_spike_reset = !live_contact_reset &&
+                              (t_ms >= g_ppg_ignore_until_ms) &&
+                              (f_abs(y) > PPG_FILTER_SPIKE_RESET_ADC);
+    if (filter_spike_reset) {
+        ppg_reset_filter_state(x, t_ms);
+        g_ppg_last_raw = x;
+        y = 0.0f;
+        y_clean = 0.0f;
+
+        g_ppg_total_cnt_5s = 1;
+        g_ppg_saturation_5s = false;
+        g_ppg_clip_cnt_5s = 0;
+        if (ppg_raw >= (PPG_ADC_MAX - PPG_SAT_EPS) || ppg_raw <= (PPG_ADC_MIN + PPG_SAT_EPS)) {
+            g_ppg_saturation_5s = true;
+            g_ppg_clip_cnt_5s = 1;
+        }
+        g_ppg_raw_min_5s = x;
+        g_ppg_raw_max_5s = x;
+        g_ppg_raw_sum_5s = x;
+        g_ppg_abs_filt_sum_5s = 0.0f;
+    }
+
     /* SQI proxy: band power / total power in filtered non-DC signal. */
     g_ppg_energy_band_5s  += (y * y);
     g_ppg_energy_total_5s += (g_ppg_hp * g_ppg_hp);
+    g_ppg_abs_filt_sum_5s += f_abs(y);
 
     /* Rolling ~3 s mean/std. */
     float alpha = dt / (3.0f + dt);
@@ -565,76 +853,126 @@ void algo_v0_push_ppg(uint32_t red, uint32_t ir, uint32_t green, int64_t t_ms)
     g_ppg_mean_ewma += alpha * d;
     g_ppg_var_ewma  = (1.0f - alpha) * (g_ppg_var_ewma + alpha * d * d);
     float sigma = sqrtf(MAX(g_ppg_var_ewma, 1.0f));
-    float th = g_ppg_mean_ewma + 0.82f * sigma;
+    float th = g_ppg_mean_ewma + PPG_PEAK_SIGMA_K * sigma;
 
-    bool settling = (t_ms < g_ppg_ignore_until_ms);
+    bool settling = (t_ms < g_ppg_ignore_until_ms) ||
+                    (t_ms < g_ppg_recovery_until_ms);
 
-    bool is_peak = !settling &&
-                   (g_ppg_y_prev1 > th) &&
-                   (g_ppg_y_prev1 > g_ppg_y_prev2) &&
-                   (g_ppg_y_prev1 > y);
+    float local_prom = g_ppg_y_prev1 - MAX(g_ppg_y_prev2, y);
+    bool local_max = (g_ppg_y_prev1 > g_ppg_y_prev2) && (g_ppg_y_prev1 >= y);
+
+    /* Wrist peak candidate detection:
+     * - Keep positive-peak polarity for now because the current GUI/logs show
+     *   the usable beat markers on positive crests.
+     * - Use a softer adaptive threshold and small prominence requirement.
+     * - The refractory/IBI gate below prevents tiny noise bumps from becoming
+     *   separate beats.
+     */
+    bool is_peak_candidate = !settling &&
+                             !live_contact_reset &&
+                             !filter_spike_reset &&
+                             local_max &&
+                             (g_ppg_y_prev1 > th) &&
+                             (g_ppg_y_prev1 > PPG_PEAK_MIN_POS_ADC) &&
+                             (local_prom >= PPG_PEAK_PROM_MIN_ADC);
 
     int peak_accepted = 0;
     int32_t ibi_report_ms = 0;
+    int32_t cand_ibi_ms = 0;
     float hr_inst = -1.0f;
 
-    if (is_peak) {
+    /* Only clean windows are allowed to advance the beat anchor.
+     * Candidate diagnostics are streamed even if the candidate is rejected.
+     */
+    bool peak_quality_ok = g_last_ppg_quality_ok &&
+                           !g_last_ppg_artifact_live &&
+                           !g_last_ppg_contact_artifact_live;
+
+    if (is_peak_candidate && peak_quality_ok) {
         /* The peak is the previous sample, so use the previous timestamp.
          * This is more accurate for IBI/PRV than using the current sample time.
          */
         int64_t peak_t = (g_ppg_t_prev1 > 0) ? g_ppg_t_prev1 : t_ms;
-        int64_t since = peak_t - g_last_peak_t;
 
-        if (since >= PEAK_REFRACTORY_MS) {
-            if (g_last_peak_t > 0) {
-                int64_t ibi = peak_t - g_last_peak_t;
-                if (ibi >= IBI_MIN_MS && ibi <= IBI_MAX_MS) {
-                    bool ok = true;
+        if (g_last_peak_t > 0) {
+            cand_ibi_ms = (int32_t)(peak_t - g_last_peak_t);
+        }
 
-                    if (g_last5_n >= 3) {
-                        uint16_t tmp[5];
-                        int n = MIN(g_last5_n, 5);
-                        for (int i = 0; i < n; i++) tmp[i] = g_last5_ibi[i];
+        if (g_last_peak_t <= 0 || cand_ibi_ms > IBI_MAX_MS) {
+            /* First clean beat or detector lost lock: re-anchor. Report the
+             * marker so the GUI shows that lock was reacquired, but do not
+             * report HR/IBI until the next clean beat.
+             */
+            g_last_peak_t = peak_t;
+            peak_accepted = 1;
+        } else if (cand_ibi_ms >= IBI_MIN_MS) {
+            bool ok = true;
 
-                        for (int i = 0; i < n - 1; i++) {
-                            for (int j = i + 1; j < n; j++) {
-                                if (tmp[j] < tmp[i]) {
-                                    uint16_t t = tmp[i];
-                                    tmp[i] = tmp[j];
-                                    tmp[j] = t;
-                                }
-                            }
+#if PPG_USE_IBI_OUTLIER_REJECT
+            if (g_last5_n >= 3) {
+                uint16_t tmp[5];
+                int n = MIN(g_last5_n, 5);
+                for (int i = 0; i < n; i++) tmp[i] = g_last5_ibi[i];
+
+                for (int i = 0; i < n - 1; i++) {
+                    for (int j = i + 1; j < n; j++) {
+                        if (tmp[j] < tmp[i]) {
+                            uint16_t t = tmp[i];
+                            tmp[i] = tmp[j];
+                            tmp[j] = t;
                         }
-
-                        uint16_t med = (n & 1)
-                                     ? tmp[n / 2]
-                                     : (uint16_t)((tmp[n / 2 - 1] + tmp[n / 2]) / 2);
-                        float frac = f_abs((float)ibi - (float)med) / (float)MAX(med, 1);
-                        if (frac > IBI_OUTLIER_FRAC) ok = false;
-                    }
-
-                    if (ok) {
-                        if (g_ibi_n < IBI_MAX_PER_MIN) {
-                            g_ibi_ms[g_ibi_n] = (uint16_t)ibi;
-                            g_ibi_t_ms[g_ibi_n] = peak_t;
-                            g_ibi_n++;
-                        }
-
-                        if (g_last5_n < 5) {
-                            g_last5_ibi[g_last5_n++] = (uint16_t)ibi;
-                        } else {
-                            memmove(&g_last5_ibi[0], &g_last5_ibi[1], 4 * sizeof(uint16_t));
-                            g_last5_ibi[4] = (uint16_t)ibi;
-                        }
-
-                        peak_accepted = 1;
-                        ibi_report_ms = (int32_t)ibi;
-                        hr_inst = 60000.0f / (float)ibi;
                     }
                 }
-            }
 
-            g_last_peak_t = peak_t;
+                uint16_t med = (n & 1)
+                             ? tmp[n / 2]
+                             : (uint16_t)((tmp[n / 2 - 1] + tmp[n / 2]) / 2);
+                float frac = f_abs((float)cand_ibi_ms - (float)med) / (float)MAX(med, 1);
+                if (frac > IBI_OUTLIER_FRAC) ok = false;
+            }
+#endif
+
+            if (ok) {
+                if (g_ibi_n < IBI_MAX_PER_MIN) {
+                    g_ibi_ms[g_ibi_n] = (uint16_t)cand_ibi_ms;
+                    g_ibi_t_ms[g_ibi_n] = peak_t;
+                    g_ibi_n++;
+                }
+
+                if (g_last5_n < 5) {
+                    g_last5_ibi[g_last5_n++] = (uint16_t)cand_ibi_ms;
+                } else {
+                    memmove(&g_last5_ibi[0], &g_last5_ibi[1], 4 * sizeof(uint16_t));
+                    g_last5_ibi[4] = (uint16_t)cand_ibi_ms;
+                }
+
+                g_last_peak_t = peak_t;
+                peak_accepted = 1;
+                ibi_report_ms = cand_ibi_ms;
+
+                /* Report HR from the median of the recent clean IBIs rather
+                 * than the latest IBI alone.  This makes live HR less jumpy
+                 * while keeping the original IBI in the stream for debugging.
+                 */
+                uint16_t hr_tmp[5];
+                int hr_n = MIN(g_last5_n, 5);
+                for (int i = 0; i < hr_n; i++) {
+                    hr_tmp[i] = g_last5_ibi[i];
+                }
+                for (int i = 0; i < hr_n - 1; i++) {
+                    for (int j = i + 1; j < hr_n; j++) {
+                        if (hr_tmp[j] < hr_tmp[i]) {
+                            uint16_t t = hr_tmp[i];
+                            hr_tmp[i] = hr_tmp[j];
+                            hr_tmp[j] = t;
+                        }
+                    }
+                }
+                uint16_t hr_ibi = (hr_n <= 0) ? (uint16_t)cand_ibi_ms :
+                                  ((hr_n & 1) ? hr_tmp[hr_n / 2] :
+                                   (uint16_t)((hr_tmp[hr_n / 2 - 1] + hr_tmp[hr_n / 2]) / 2));
+                hr_inst = 60000.0f / (float)MAX(hr_ibi, 1);
+            }
         }
     }
 
@@ -651,16 +989,39 @@ void algo_v0_push_ppg(uint32_t red, uint32_t ir, uint32_t green, int64_t t_ms)
         hr_report = -1.0f;
     }
 
+    int peak_report = (g_last_ppg_quality_ok && !g_last_ppg_artifact_live) ? peak_accepted : 0;
+
+    float dc_range_live = NAN;
+    if (g_ppg_raw_min_5s != FLT_MAX && g_ppg_raw_max_5s != -FLT_MAX) {
+        dc_range_live = g_ppg_raw_max_5s - g_ppg_raw_min_5s;
+    }
+    float ac_live = g_ppg_ac_env;
+    float acdc_live = (g_ppg_dc_ema > 1.0f) ? (ac_live / g_ppg_dc_ema) : NAN;
+    int contact_live = ((!isnan(dc_range_live) && dc_range_live > PPG_DC_RANGE_ART_ADC) ||
+                        live_contact_reset ||
+                        filter_spike_reset ||
+                        (t_ms < g_ppg_recovery_until_ms)) ? 1 : 0;
+
     ppg_stream_send_sample(t_ms,
                            g_ppg_val_seq++,
                            ppg_raw,
                            green,
                            y,
+                           y_clean,
                            th,
-                           peak_accepted,
+                           peak_report,
                            ibi_report,
                            hr_report,
-                           g_ppg_fs_hz);
+                           g_ppg_fs_hz,
+                           g_ppg_dc_ema,
+                           dc_range_live,
+                           ac_live,
+                           acdc_live,
+                           contact_live,
+                           is_peak_candidate ? 1 : 0,
+                           local_prom,
+                           g_ppg_y_prev1,
+                           cand_ibi_ms);
 #endif
 
     g_ppg_y_prev2 = g_ppg_y_prev1;
@@ -716,6 +1077,10 @@ static void reset_5s_accumulators(void)
     g_ppg_total_cnt_5s = 0;
     g_ppg_energy_band_5s = 0.0f;
     g_ppg_energy_total_5s = 0.0f;
+    g_ppg_raw_min_5s = FLT_MAX;
+    g_ppg_raw_max_5s = -FLT_MAX;
+    g_ppg_raw_sum_5s = 0.0f;
+    g_ppg_abs_filt_sum_5s = 0.0f;
 }
 
 static void run_fast_5s(int64_t now_ms)
@@ -732,6 +1097,12 @@ static void run_fast_5s(int64_t now_ms)
 
     float clip_frac = NAN;
     float ppg_sqi = NAN;
+    float dc_range = NAN;
+    float dc_mean = NAN;
+    float ac_amp = NAN;
+    float acdc = NAN;
+    bool contact_artifact = false;
+
     if (ppg_present) {
         clip_frac = (float)g_ppg_clip_cnt_5s / (float)MAX(g_ppg_total_cnt_5s, 1);
         if (g_ppg_energy_total_5s > 0.0f) {
@@ -739,6 +1110,16 @@ static void run_fast_5s(int64_t now_ms)
         } else {
             ppg_sqi = 0.0f;
         }
+
+        if (g_ppg_raw_min_5s != FLT_MAX && g_ppg_raw_max_5s != -FLT_MAX) {
+            dc_range = g_ppg_raw_max_5s - g_ppg_raw_min_5s;
+        }
+        dc_mean = g_ppg_raw_sum_5s / (float)MAX(g_ppg_total_cnt_5s, 1);
+        ac_amp = g_ppg_abs_filt_sum_5s / (float)MAX(g_ppg_total_cnt_5s, 1);
+        acdc = (dc_mean > 1.0f) ? (ac_amp / dc_mean) : NAN;
+
+        contact_artifact = (!isnan(dc_range) && (dc_range > PPG_DC_RANGE_ART_ADC)) ||
+                           (now_ms < g_ppg_recovery_until_ms);
     }
 
     bool artifact = false;
@@ -751,7 +1132,12 @@ static void run_fast_5s(int64_t now_ms)
             (sma > TH_SMA_G) ||
             (ppg_sqi < TH_PPG_SQI) ||
             g_ppg_saturation_5s ||
-            (clip_frac > TH_CLIP_FRAC);
+            (clip_frac > TH_CLIP_FRAC) ||
+            contact_artifact ||
+            isnan(ac_amp) ||
+            (ac_amp < PPG_AC_MIN_ADC) ||
+            isnan(acdc) ||
+            (acdc < PPG_ACDC_MIN);
     }
 
     if (now_ms < g_ppg_ignore_until_ms) {
@@ -760,12 +1146,21 @@ static void run_fast_5s(int64_t now_ms)
 
     g_last_ppg_sqi_live = ppg_present ? ppg_sqi : NAN;
     g_last_ppg_artifact_live = artifact;
+    g_last_ppg_dc_range_live = ppg_present ? dc_range : NAN;
+    g_last_ppg_ac_live = ppg_present ? ac_amp : NAN;
+    g_last_ppg_acdc_live = ppg_present ? acdc : NAN;
+    g_last_ppg_contact_artifact_live = ppg_present ? contact_artifact : false;
     g_last_ppg_quality_ok =
         ppg_present &&
         (now_ms >= g_ppg_ignore_until_ms) &&
         !artifact &&
         !isnan(ppg_sqi) &&
-        (ppg_sqi >= TH_PPG_SQI);
+        (ppg_sqi >= TH_PPG_SQI) &&
+        !contact_artifact &&
+        !isnan(ac_amp) &&
+        (ac_amp >= PPG_AC_MIN_ADC) &&
+        !isnan(acdc) &&
+        (acdc >= PPG_ACDC_MIN);
 
     if (g_5s_idx < FAST_WINDOWS_PER_MIN) {
         g_artifact_5s[g_5s_idx] = artifact ? 1u : 0u;
@@ -780,9 +1175,9 @@ static void run_fast_5s(int64_t now_ms)
 
 #if PPG_VALIDATION_MODE
     if (ble_log_is_ready()) {
-        char line[192];
+        char line[256];
         int n = snprintk(line, sizeof(line),
-            "PV_WIN,t=%lld,ppg_n=%u,sqi=%.3f,clip=%.3f,sat=%d,art=%d,qok=%d,settle=%d,sma=%.3f,acc_var=%.4f\r\n",
+            "PV_WIN,t=%lld,ppg_n=%u,sqi=%.3f,clip=%.3f,sat=%d,art=%d,qok=%d,settle=%d,sma=%.3f,acc_var=%.4f,dc_rng=%.1f,ac=%.2f,acdc=%.5f,contact=%d\r\n",
             now_ms,
             g_ppg_total_cnt_5s,
             isnan(ppg_sqi) ? -1.0 : (double)ppg_sqi,
@@ -792,13 +1187,17 @@ static void run_fast_5s(int64_t now_ms)
             g_last_ppg_quality_ok ? 1 : 0,
             (now_ms < g_ppg_ignore_until_ms) ? 1 : 0,
             isnan(sma) ? -1.0 : (double)sma,
-            isnan(accel_var) ? -1.0 : (double)accel_var);
+            isnan(accel_var) ? -1.0 : (double)accel_var,
+            isnan(dc_range) ? -1.0 : (double)dc_range,
+            isnan(ac_amp) ? -1.0 : (double)ac_amp,
+            isnan(acdc) ? -1.0 : (double)acdc,
+            contact_artifact ? 1 : 0);
         if (n > 0) {
             (void)ble_log_send_as((const uint8_t *)line, (size_t)n);
         }
     }
 #else
-    LOG_INF("[V0][5s] t=%lld acc_n=%d ppg_n=%u accel_var=%.4f sma=%.3f ppg_sqi=%.3f sat=%d clip=%.3f ART=%d",
+    LOG_INF("[V0][5s] t=%lld acc_n=%d ppg_n=%u accel_var=%.4f sma=%.3f ppg_sqi=%.3f sat=%d clip=%.3f dc_rng=%.1f ac=%.2f acdc=%.5f contact=%d ART=%d",
             now_ms,
             g_acc_count_5s,
             g_ppg_total_cnt_5s,
@@ -807,6 +1206,10 @@ static void run_fast_5s(int64_t now_ms)
             isnan(ppg_sqi) ? -1.0f : ppg_sqi,
             (int)g_ppg_saturation_5s,
             isnan(clip_frac) ? -1.0f : clip_frac,
+            isnan(dc_range) ? -1.0f : dc_range,
+            isnan(ac_amp) ? -1.0f : ac_amp,
+            isnan(acdc) ? -1.0f : acdc,
+            contact_artifact ? 1 : 0,
             (int)artifact);
 #endif
 
@@ -1328,10 +1731,27 @@ void algo_v0_init(void)
     g_ppg_total_cnt_5s = 0;
     g_ppg_energy_band_5s = 0.0f;
     g_ppg_energy_total_5s = 0.0f;
+    g_ppg_raw_min_5s = FLT_MAX;
+    g_ppg_raw_max_5s = -FLT_MAX;
+    g_ppg_raw_sum_5s = 0.0f;
+    g_ppg_abs_filt_sum_5s = 0.0f;
+    g_ppg_dc_ema = 0.0f;
+    g_ppg_ac_env = 0.0f;
+    g_last_ppg_dc_range_live = NAN;
+    g_last_ppg_ac_live = NAN;
+    g_last_ppg_acdc_live = NAN;
+    g_last_ppg_contact_artifact_live = false;
 
     g_last_ppg_t = -1;
+    g_ppg_ignore_until_ms = 0;
+    g_ppg_recovery_until_ms = 0;
+    g_ppg_last_raw = NAN;
     g_ppg_hp = 0.0f;
     g_ppg_lp = 0.0f;
+    g_ppg_clean_hp = 0.0f;
+    g_ppg_clean_lp = 0.0f;
+    g_ppg_clean_smooth = 0.0f;
+    g_ppg_clean_x_prev = 0.0f;
     g_ppg_mean_ewma = 0.0f;
     g_ppg_var_ewma = 1.0f;
     g_ppg_x_prev = 0.0f;

@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Wrist PPG Web GUI - Live Fix</title>
+<style>
+  :root{
+    --bg:#111214; --panel:#1c1d21; --panel2:#272a30; --text:#f5f5f5;
+    --muted:#b7b7b7; --accent:#38bdf8; --good:#22c55e; --warn:#f59e0b; --bad:#ef4444;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,sans-serif;overflow:hidden}
+  #app{height:100vh;display:flex;flex-direction:column;min-width:0}
+  header{background:var(--panel);border-bottom:1px solid #333;padding:8px 10px;display:flex;flex-direction:column;gap:6px;flex:0 0 auto}
+  .row{display:flex;align-items:center;gap:7px;flex-wrap:wrap}
+  button,select,input[type=text]{background:var(--panel2);color:var(--text);border:1px solid #3f3f46;border-radius:7px;padding:6px 9px;font-size:13px}
+  button:hover{border-color:var(--accent);cursor:pointer}.primary{background:#075985;border-color:#0ea5e9}
+  label{display:inline-flex;align-items:center;gap:5px;font-size:13px;white-space:nowrap}
+  input[type=checkbox]{width:16px;height:16px;accent-color:var(--accent)}
+  input.uuid{width:300px;font-family:ui-monospace,Consolas,monospace;font-size:11px}
+  input.namePrefix{width:115px;font-family:ui-monospace,Consolas,monospace;font-size:11px}
+  .badge{padding:2px 8px;border-radius:999px;font-weight:700;font-size:12px}
+  .good{background:rgba(34,197,94,.18);color:#86efac}.warn{background:rgba(245,158,11,.18);color:#fde68a}.bad{background:rgba(239,68,68,.18);color:#fca5a5}
+  #statusLine{font-family:ui-monospace,Consolas,monospace;font-size:12px;line-height:1.25;white-space:normal;color:#fff}
+  #main{flex:1 1 auto;min-height:0;display:grid;grid-template-columns:minmax(0,1fr);background:white}
+  #main.showSide{grid-template-columns:minmax(0,1fr) 300px}
+  #plotWrap{position:relative;min-width:0;min-height:0;background:#fff}
+  canvas{display:block;width:100%;height:100%}
+  #side{display:none;background:var(--panel);border-left:1px solid #333;padding:8px;overflow:auto}
+  #main.showSide #side{display:block}
+  .card{background:#171717;border:1px solid #303030;border-radius:10px;padding:9px;margin-bottom:8px}
+  .card h3{margin:0 0 8px;font-size:14px;color:var(--accent)}
+  .kv{display:grid;grid-template-columns:1fr auto;gap:5px;font-size:12px}.kv span:nth-child(odd){color:var(--muted)}
+  #logBox{height:240px;overflow:auto;background:#050505;border:1px solid #333;border-radius:8px;padding:8px;color:#ddd;font-family:ui-monospace,Consolas,monospace;font-size:11px;white-space:pre-wrap}
+  .hint{color:var(--muted);font-size:12px;line-height:1.35}
+  .hidden{display:none!important}
+  @media(max-width:1000px){
+    body{overflow:auto} #app{height:auto;min-height:100vh} #main,#main.showSide{height:70vh;grid-template-columns:1fr} #side{display:none!important}
+    input.uuid{width:230px}
+  }
+</style>
+</head>
+<body>
+<div id="app">
+<header>
+  <div class="row">
+    <button id="connectBtn" class="primary">Connect BLE</button>
+    <button id="disconnectBtn">Disconnect</button>
+    <button id="clearBtn">Clear Plot</button>
+    <button id="saveBtn">Save CSV</button>
+    <button id="csvBtn">Load CSV</button><input id="csvInput" type="file" accept=".csv,text/csv" hidden />
+    <span id="connBadge" class="badge warn">Disconnected</span>
+    <span class="hint">For live test keep logs OFF and Mask bad samples OFF.</span>
+  </div>
+
+  <div class="row">
+    <label>View
+      <select id="viewSel">
+        <option selected>Live all clean 10 s</option>
+        <option>Reference smooth 10 s</option>
+        <option>Best clean 10 s</option>
+        <option>Clean + peaks</option>
+        <option>Debug raw + clean</option>
+      </select>
+    </label>
+    <label>Window
+      <select id="windowSel"><option selected>10</option><option>20</option><option>30</option><option>60</option><option>All</option></select>
+    </label>
+    <label><input id="normCb" type="checkbox" checked>Normalize</label>
+    <label><input id="maskBadCb" type="checkbox">Mask bad samples</label>
+    <label><input id="smoothCb" type="checkbox" checked>Display smoothing</label>
+    <label><input id="strictCb" type="checkbox">Strict HR-ready only</label>
+    <label><input id="pauseCb" type="checkbox">Pause plot</label>
+    <label><input id="showLogsCb" type="checkbox">Show slow logs</label>
+    <label><input id="sideCb" type="checkbox">Side panel</label>
+  </div>
+
+  <div class="row">
+    <label>BLE chooser
+      <select id="connectMode"><option value="any" selected>Any BLE device</option><option value="name">Name prefix</option><option value="service">Advertised service</option></select>
+    </label>
+    <label>Name <input id="namePrefix" class="namePrefix" type="text" value="SMARTWATCH"></label>
+    <label>Service UUID <input id="serviceUuid" class="uuid" type="text" value="9f7b0000-6c35-4d2c-9c85-4a8c1a2b3c4d"></label>
+    <label>Notify UUID <input id="charUuid" class="uuid" type="text" value="9f7b0001-6c35-4d2c-9c85-4a8c1a2b3c4d"></label>
+  </div>
+
+  <div id="statusLine">Waiting for compact C stream. Expected: C,t_ms,seq,green,clean,peak,qok,artifact,contact,hr,fs,sqi,acdc</div>
+</header>
+
+<div id="main">
+  <div id="plotWrap"><canvas id="plotCanvas"></canvas></div>
+  <aside id="side">
+    <div class="card"><h3>Quality summary</h3><div class="kv" id="qualityGrid"></div></div>
+    <div class="card"><h3>Rules</h3><div class="hint">
+      Continuous display uses all samples.<br>
+      Mask bad samples hides art=1/qok=0 and can make the graph look broken.<br>
+      Strict HR-ready only is for HR/HRV validation, not for normal viewing.
+    </div></div>
+    <div class="card"><h3>Slow debug logs</h3><div id="logBox"></div></div>
+  </aside>
+</div>
+</div>
+
+<script>
+(() => {
+'use strict';
+
+const MAX_POINTS = 9000;
+const BEST_WINDOW_SEC = 10;
+const BEST_SEARCH_LAST_SEC = 160;
+const BEST_STEP_SEC = 0.5;
+const MIN_RATE = 15;
+const MIN_QOK_STRICT = 0.85;
+const MAX_ART_STRICT = 0.15;
+const MAX_CONTACT_STRICT = 0.05;
+const MIN_ACDC_STRICT = 0.0025;
+const MIN_PEAKS = 6, MAX_PEAKS = 14, TARGET_PEAKS = 9;
+const MAX_IBI_CV = 0.30;
+const GAP_BREAK = 0.25;
+
+const $ = id => document.getElementById(id);
+const canvas=$('plotCanvas'), ctx=canvas.getContext('2d');
+const statusLine=$('statusLine'), qualityGrid=$('qualityGrid'), logBox=$('logBox'), connBadge=$('connBadge');
+const controls = ['viewSel','windowSel','normCb','maskBadCb','smoothCb','strictCb','pauseCb','showLogsCb','sideCb','connectMode','namePrefix','serviceUuid','charUuid']
+  .reduce((o,id)=>{o[id]=$(id);return o;},{});
+let samples=[], firstT=null, rxBuf='', lineQueue=[], dropped=0, logs=[];
+let device=null, server=null, notifyChar=null, bestCache={key:'',data:[],info:{}};
+let lastDraw=0, latestInfo={};
+const decoder = new TextDecoder();
+
+function num(v,d=NaN){ const x=Number(v); return Number.isFinite(x)?x:d; }
+function fmt(v,d=1,missing='NA'){ v=Number(v); return Number.isFinite(v)?v.toFixed(d):missing; }
+function median(a){ const v=a.filter(Number.isFinite).sort((x,y)=>x-y); if(!v.length)return NaN; const m=v.length>>1; return v.length&1?v[m]:(v[m-1]+v[m])/2; }
+function pct(a,p){ const v=a.filter(Number.isFinite).sort((x,y)=>x-y); if(!v.length)return NaN; const i=Math.max(0,Math.min(v.length-1,Math.round(p*(v.length-1)))); return v[i]; }
+function good(s){ return num(s.qok,0)>=0.5 && num(s.art,1)<0.5 && num(s.contact,1)<0.5 && num(s.settle,0)<0.5; }
+
+function parseLine(line){
+  const low=line.toLowerCase();
+  if(low.startsWith('c,')){
+    const p=line.split(',');
+    if(p.length<13)return null;
+    const t_ms=num(p[1]), green=num(p[3]), clean=num(p[4]);
+    if(!Number.isFinite(t_ms)||!Number.isFinite(clean))return null;
+    return {src:'C',t_ms,seq:num(p[2]),raw:green,green,filt:clean,clean,th:NaN,peak:num(p[5],0),qok:num(p[6],0),
+      art:num(p[7],1),contact:num(p[8],1),hr:num(p[9],-1),fs:num(p[10],-1),sqi:num(p[11],-1),acdc:num(p[12],NaN),
+      ibi:0,settle:0,dc:NaN,dc_rng:NaN,ac:NaN,cand:0,prom:NaN,pkamp:NaN,cibi:0};
+  }
+  if(!(low.startsWith('pv,')||low.startsWith('ppg_stream,')||low.startsWith('pc,')))return null;
+  // Do NOT use PV as plot source. It is slow debug and makes live plot misleading.
+  return {src:'DEBUG_ONLY', line};
+}
+
+function addSample(s){
+  if(firstT===null) firstT=s.t_ms;
+  s.t_s=(s.t_ms-firstT)/1000;
+  samples.push(s);
+  if(samples.length>MAX_POINTS) samples.splice(0,samples.length-MAX_POINTS);
+}
+
+function queueChunk(text){
+  rxBuf += text.replace(/\r\n/g,'\n').replace(/\r/g,'\n');
+  let i;
+  while((i=rxBuf.indexOf('\n'))>=0){
+    const line=rxBuf.slice(0,i).trim(); rxBuf=rxBuf.slice(i+1);
+    if(line){ if(lineQueue.length>7000){lineQueue.shift();dropped++;} lineQueue.push(line); }
+  }
+}
+function appendLog(line){
+  if(!controls.showLogsCb.checked) return;
+  logs.push(line); while(logs.length>120) logs.shift();
+  logBox.textContent = logs.join('\n'); logBox.scrollTop = logBox.scrollHeight;
+}
+function processLines(){
+  let n=0;
+  while(lineQueue.length && n<600){
+    const line=lineQueue.shift(); n++;
+    const s=parseLine(line);
+    if(s && s.src==='C') addSample(s);
+    else if(s && s.src==='DEBUG_ONLY') appendLog(s.line);
+    else appendLog(line);
+  }
+}
+
+function gapInfo(data){
+  if(data.length<2)return {maxGap:999,badFrac:1};
+  const gaps=[]; for(let i=1;i<data.length;i++)gaps.push(data[i].t_s-data[i-1].t_s);
+  return {maxGap:Math.max(...gaps),badFrac:gaps.filter(g=>g>GAP_BREAK).length/Math.max(1,gaps.length)};
+}
+function peakInfo(data){
+  const pt=data.filter(s=>good(s)&&num(s.peak,0)>=0.5).map(s=>s.t_s);
+  if(pt.length<2)return {peaks:pt.length,cv:999,hr:NaN,score:-30};
+  const ibis=[]; for(let i=1;i<pt.length;i++)ibis.push((pt[i]-pt[i-1])*1000);
+  const plausible=ibis.filter(v=>v>=450&&v<=1800);
+  if(plausible.length<Math.max(2,Math.floor(0.55*ibis.length)))return {peaks:pt.length,cv:999,hr:NaN,score:-40};
+  const med=median(plausible), mad=median(plausible.map(v=>Math.abs(v-med))), cv=mad/Math.max(med,1);
+  return {peaks:pt.length,cv,hr:60000/med,score:Math.max(0,30*(1-Math.min(cv/MAX_IBI_CV,1)))};
+}
+function qualitySummary(data){
+  if(!data.length)return {qokPct:0,artPct:0,peaks:0,hrMed:NaN};
+  const g=data.filter(good), p=g.filter(s=>num(s.peak,0)>=.5);
+  const hrVals=g.map(s=>num(s.hr,NaN)).filter(v=>v>0);
+  return {qokPct:100*g.length/data.length,artPct:100*data.filter(s=>num(s.art,1)>=.5).length/data.length,
+          peaks:p.length,hrMed:median(hrVals)};
+}
+function scoreWindow(data){
+  if(!data.length)return {score:-1e9,strictOk:false};
+  const dur=Math.max(.001,data[data.length-1].t_s-data[0].t_s), rate=data.length/dur;
+  const g=data.filter(good), goodFrac=g.length/data.length, artFrac=data.filter(s=>num(s.art,1)>=.5).length/data.length, contactFrac=data.filter(s=>num(s.contact,1)>=.5).length/data.length;
+  const sqiMean=g.reduce((a,s)=>a+num(s.sqi,0),0)/Math.max(1,g.length);
+  const acdcMed=median(g.map(s=>num(s.acdc,NaN)));
+  const pk=peakInfo(data), gap=gapInfo(data);
+  let score=130*goodFrac + 35*Math.min(sqiMean,1) + 35*Math.min((acdcMed||0)/0.0045,1.4) + pk.score
+    + ((pk.peaks>=MIN_PEAKS && pk.peaks<=MAX_PEAKS)?25-3*Math.abs(pk.peaks-TARGET_PEAKS):-25)
+    - 50*gap.badFrac;
+  if(rate<MIN_RATE)score-=200;
+  if((acdcMed||0)<0.0015)score-=80;
+  const strictOk = rate>=MIN_RATE && goodFrac>=MIN_QOK_STRICT && artFrac<=MAX_ART_STRICT && contactFrac<=MAX_CONTACT_STRICT &&
+    (acdcMed||0)>=MIN_ACDC_STRICT && pk.peaks>=MIN_PEAKS && pk.peaks<=MAX_PEAKS && (pk.cv===999||pk.cv<=MAX_IBI_CV) && gap.maxGap<=0.20;
+  return {score,strictOk,goodFrac,artFrac,contactFrac,rate,sqiMean,acdcMed,peaks:pk.peaks,ibiCv:pk.cv,hr:pk.hr,maxGap:gap.maxGap};
+}
+function bestWindow(){
+  if(!samples.length)return {data:[],info:scoreWindow([])};
+  const latest=samples[samples.length-1].t_s, key=`${samples.length>>5}-${Math.floor(latest/1.5)}-${controls.strictCb.checked}`;
+  if(bestCache.key===key) return bestCache;
+  const start=Math.max(samples[0].t_s, latest-BEST_SEARCH_LAST_SEC);
+  const data=samples.filter(s=>s.t_s>=start);
+  let best=[], info={score:-1e9,strictOk:false}, si=0, ei=0;
+  for(let t0=data[0]?.t_s||0; t0<=latest-BEST_WINDOW_SEC; t0+=BEST_STEP_SEC){
+    const t1=t0+BEST_WINDOW_SEC;
+    while(si<data.length && data[si].t_s<t0)si++;
+    if(ei<si)ei=si;
+    while(ei<data.length && data[ei].t_s<=t1)ei++;
+    const win=data.slice(si,ei);
+    if(win.length<MIN_RATE*BEST_WINDOW_SEC*.75)continue;
+    const inf=scoreWindow(win);
+    if(inf.score>info.score){best=win; info=inf;}
+  }
+  if(controls.strictCb.checked && !info.strictOk) best=[];
+  bestCache={key,data:best,info}; return bestCache;
+}
+function selectedData(){
+  const view=controls.viewSel.value;
+  if(view==='Reference smooth 10 s'||view==='Best clean 10 s') return bestWindow().data;
+  const sec=controls.windowSel.value==='All'?Infinity:Number(controls.windowSel.value);
+  if(!Number.isFinite(sec))return samples.slice();
+  const start=samples.length?samples[samples.length-1].t_s-sec:0;
+  return samples.filter(s=>s.t_s>=start);
+}
+function movingAvg(vals,w){
+  if(!controls.smoothCb.checked||w<=1)return vals;
+  const r=Math.floor(w/2), out=[];
+  for(let i=0;i<vals.length;i++){
+    if(!Number.isFinite(vals[i])){out.push(NaN);continue;}
+    let sum=0,n=0; for(let j=Math.max(0,i-r);j<Math.min(vals.length,i+r+1);j++)if(Number.isFinite(vals[j])){sum+=vals[j];n++;}
+    out.push(n?sum/n:NaN);
+  }
+  return out;
+}
+function refMorph(vals,t){
+  const gaps=[]; for(let i=1;i<t.length;i++)if(t[i]>t[i-1])gaps.push(t[i]-t[i-1]);
+  const fs=gaps.length?1/Math.max(.001,median(gaps)):25;
+  const trendW=Math.max(5,(Math.round(1.1*fs)|1)), r=trendW>>1;
+  let out=[];
+  for(let i=0;i<vals.length;i++){
+    if(!Number.isFinite(vals[i])){out.push(NaN);continue;}
+    let sum=0,n=0; for(let j=Math.max(0,i-r);j<Math.min(vals.length,i+r+1);j++)if(Number.isFinite(vals[j])){sum+=vals[j];n++;}
+    out.push(n>=3?vals[i]-sum/n:NaN);
+  }
+  out=movingAvg(out,Math.max(3,(Math.round(.16*fs)|1)));
+  return out;
+}
+function normalize(vals){
+  if(!controls.normCb.checked)return vals;
+  const v=vals.filter(Number.isFinite); if(v.length<8)return vals;
+  const lo=pct(v,.05), hi=pct(v,.95), mid=(lo+hi)/2, half=Math.max(1e-6,(hi-lo)/2);
+  return vals.map(x=>Number.isFinite(x)?Math.max(-120,Math.min(120,((x-mid)/half)*80)):NaN);
+}
+function resize(){
+  const r=canvas.getBoundingClientRect(), dpr=window.devicePixelRatio||1, w=Math.max(100,Math.floor(r.width*dpr)), h=Math.max(100,Math.floor(r.height*dpr));
+  if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h;}
+}
+function draw(){
+  if(controls.pauseCb.checked)return;
+  resize();
+  const W=canvas.width,H=canvas.height,dpr=window.devicePixelRatio||1;
+  ctx.clearRect(0,0,W,H); ctx.fillStyle='#fff'; ctx.fillRect(0,0,W,H);
+  const data=selectedData();
+  const info=(controls.viewSel.value==='Reference smooth 10 s'||controls.viewSel.value==='Best clean 10 s')?bestWindow().info:scoreWindow(data);
+  latestInfo=info;
+  if(!data.length){
+    ctx.fillStyle='#111'; ctx.font=`${18*dpr}px sans-serif`;
+    ctx.fillText(controls.strictCb.checked?'No strict HR-ready 10 s window. Uncheck Strict HR-ready only for continuous live waveform.':'Waiting for compact C stream...',40*dpr,70*dpr);
+    updateStats([],info); return;
+  }
+  const m={l:65*dpr,r:24*dpr,t:38*dpr,b:50*dpr}, pw=W-m.l-m.r, ph=H-m.t-m.b;
+  const t=data.map(s=>s.t_s);
+  let y=data.map(s=>num(s.clean,NaN));
+  if(controls.maskBadCb.checked)y=y.map((v,i)=>good(data[i])?v:NaN);
+  if(controls.viewSel.value==='Reference smooth 10 s')y=refMorph(y,t);
+  else y=movingAvg(y,5);
+  y=normalize(y);
+  const yMin=controls.normCb.checked?-120:Math.min(-50,pct(y,.02)||-50), yMax=controls.normCb.checked?120:Math.max(50,pct(y,.98)||50);
+  const tMin=Math.min(...t), tMax=Math.max(...t);
+  const sx=v=>m.l+((v-tMin)/Math.max(1e-6,tMax-tMin))*pw;
+  const sy=v=>m.t+(1-(v-yMin)/Math.max(1e-6,yMax-yMin))*ph;
+
+  ctx.strokeStyle='rgba(0,0,0,.18)'; ctx.lineWidth=1*dpr; ctx.fillStyle='#111'; ctx.font=`${13*dpr}px sans-serif`;
+  for(let i=0;i<=5;i++){const x=m.l+i*pw/5; ctx.beginPath();ctx.moveTo(x,m.t);ctx.lineTo(x,m.t+ph);ctx.stroke();ctx.fillText((tMin+i*(tMax-tMin)/5).toFixed(1),x-16*dpr,H-18*dpr);}
+  for(let i=0;i<=5;i++){const yy=m.t+i*ph/5; ctx.beginPath();ctx.moveTo(m.l,yy);ctx.lineTo(m.l+pw,yy);ctx.stroke();ctx.fillText((yMax-i*(yMax-yMin)/5).toFixed(0),10*dpr,yy+4*dpr);}
+  ctx.fillStyle='#111';ctx.font=`${18*dpr}px sans-serif`;ctx.fillText('Wrist PPG validation: clean PPG morphology',m.l+110*dpr,25*dpr);
+  ctx.font=`${14*dpr}px sans-serif`;ctx.fillText('Time (s)',m.l+pw/2-30*dpr,H-10*dpr);
+  ctx.save();ctx.translate(20*dpr,m.t+ph/2+60*dpr);ctx.rotate(-Math.PI/2);ctx.fillText(controls.normCb.checked?'normalized clean PPG':'clean PPG',0,0);ctx.restore();
+
+  // shaded bad samples when not masking
+  if(!controls.maskBadCb.checked){
+    ctx.fillStyle='rgba(239,68,68,.05)';
+    for(let i=0;i<data.length;i++){
+      if(!good(data[i])){
+        const x0=sx(t[i]); const x1=i+1<data.length?sx(t[i+1]):x0+2*dpr;
+        ctx.fillRect(x0,m.t,Math.max(1,x1-x0),ph);
+      }
+    }
+  }
+
+  ctx.strokeStyle='#1f77b4';ctx.lineWidth=2.2*dpr;ctx.beginPath();
+  let started=false,lastT=null;
+  for(let i=0;i<y.length;i++){
+    if(!Number.isFinite(y[i])){started=false;lastT=null;continue;}
+    const x=sx(t[i]), yy=sy(y[i]);
+    if(!started || (lastT!==null && t[i]-lastT>GAP_BREAK)){ctx.moveTo(x,yy);started=true;} else ctx.lineTo(x,yy);
+    lastT=t[i];
+  }
+  ctx.stroke();
+
+  ctx.fillStyle='#f97316';
+  for(let i=0;i<data.length;i++){
+    if(num(data[i].peak,0)>=0.5 && Number.isFinite(y[i]) && good(data[i])){
+      ctx.beginPath();ctx.arc(sx(t[i]),sy(y[i]),4.5*dpr,0,Math.PI*2);ctx.fill();
+    }
+  }
+  // legend
+  ctx.fillStyle='#111';ctx.font=`${12*dpr}px sans-serif`;ctx.fillText('blue: clean PPG   orange: accepted peak   faint red: low-quality/artifact',m.l+10*dpr,m.t+14*dpr);
+  updateStats(data,info);
+}
+function updateStats(data,info){
+  const latest=samples[samples.length-1]||{}, q=qualitySummary(data), strict=info?.strictOk?'Y':'N';
+  statusLine.textContent=`samples=${samples.length} | shown=${data.length} | strict=${strict} | shown_qok=${fmt(q.qokPct,0)}% | art=${fmt(q.artPct,0)}% | shown_peaks=${q.peaks} | shown_hr_med=${fmt(q.hrMed,1)} | morph=${fmt(info?.score,1)} | win_acdc=${fmt(info?.acdcMed,4)} | win_ibi_cv=${fmt(info?.ibiCv,2)} | max_gap=${fmt(info?.maxGap,2)}s | fs=${fmt(latest.fs,1)}Hz | qok=${num(latest.qok,-1)} | sqi=${fmt(latest.sqi,3)} | art=${num(latest.art,-1)} | contact=${num(latest.contact,-1)} | green=${fmt(latest.green,0)} | clean=${fmt(latest.clean,2)} | acdc=${fmt(latest.acdc,4)} | queued=${lineQueue.length} | dropped=${dropped}`;
+  qualityGrid.innerHTML='';
+  [['Strict HR-ready',strict],['Shown qok',fmt(q.qokPct,0)+'%'],['Shown artifact',fmt(q.artPct,0)+'%'],['Shown peaks',q.peaks],['Shown HR med',fmt(q.hrMed,1)],['Window AC/DC',fmt(info?.acdcMed,4)],['IBI CV',fmt(info?.ibiCv,2)],['Max gap',fmt(info?.maxGap,2)+'s'],['Queue',lineQueue.length]].forEach(([a,b])=>{const x=document.createElement('span');x.textContent=a;const y=document.createElement('span');y.textContent=b;qualityGrid.append(x,y);});
+}
+function loop(ts){processLines(); if(ts-lastDraw>150){lastDraw=ts;draw();} requestAnimationFrame(loop);}
+
+async function connectBle(){
+  if(!navigator.bluetooth){alert('Web Bluetooth not available. Use Chrome/Edge on localhost or HTTPS.');return;}
+  const service=controls.serviceUuid.value.trim(), ch=controls.charUuid.value.trim();
+  try{
+    connBadge.textContent='Choosing...';connBadge.className='badge warn';
+    let opts; const mode=controls.connectMode.value,prefix=controls.namePrefix.value.trim()||'SMARTWATCH';
+    if(mode==='any') opts={acceptAllDevices:true,optionalServices:[service]};
+    else if(mode==='service') opts={filters:[{services:[service]}],optionalServices:[service]};
+    else opts={filters:[{namePrefix:prefix}],optionalServices:[service]};
+    device=await navigator.bluetooth.requestDevice(opts);
+    device.addEventListener('gattserverdisconnected',()=>{connBadge.textContent='Disconnected';connBadge.className='badge warn';});
+    connBadge.textContent='Connecting...';
+    server=await device.gatt.connect();
+    const svc=await server.getPrimaryService(service);
+    notifyChar=await svc.getCharacteristic(ch);
+    await notifyChar.startNotifications();
+    notifyChar.addEventListener('characteristicvaluechanged',ev=>queueChunk(decoder.decode(ev.target.value)));
+    connBadge.textContent='Connected'; connBadge.className='badge good';
+  }catch(e){connBadge.textContent='Failed';connBadge.className='badge bad'; alert('BLE connect failed: '+e+'\nUse Any BLE device and select SMARTWATCH.');}
+}
+async function disconnectBle(){try{if(notifyChar)await notifyChar.stopNotifications();}catch(_){} try{if(device?.gatt?.connected)device.gatt.disconnect();}catch(_){} connBadge.textContent='Disconnected';connBadge.className='badge warn';}
+function clearData(){samples=[];firstT=null;rxBuf='';lineQueue=[];dropped=0;logs=[];bestCache={key:'',data:[],info:{}};logBox.textContent='';draw();}
+function saveCsv(){
+  const keys=['t_ms','t_s','src','seq','raw','green','filt','clean','th','peak','ibi','hr','qok','sqi','art','settle','fs','dc','dc_rng','ac','acdc','contact','cand','prom','pkamp','cibi'];
+  const lines=[keys.join(',')]; samples.forEach(s=>lines.push(keys.map(k=>s[k]??'').join(',')));
+  const blob=new Blob([lines.join('\n')],{type:'text/csv'}), url=URL.createObjectURL(blob), a=document.createElement('a');
+  a.href=url;a.download='wrist_ppg_web_log.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1500);
+}
+function loadCsv(file){
+  const r=new FileReader(); r.onload=()=>{clearData(); const lines=String(r.result||'').split(/\r?\n/).filter(Boolean); if(!lines.length)return; const head=lines[0].split(',').map(s=>s.trim());
+    for(let i=1;i<lines.length;i++){const vals=lines[i].split(','), s={}; head.forEach((k,j)=>s[k]=k==='src'?(vals[j]||'CSV'):num(vals[j],NaN)); if(Number.isFinite(s.t_ms)&&Number.isFinite(s.clean))addSample(s);}
+    draw();}; r.readAsText(file);
+}
+
+$('connectBtn').onclick=connectBle; $('disconnectBtn').onclick=disconnectBle; $('clearBtn').onclick=clearData; $('saveBtn').onclick=saveCsv; $('csvBtn').onclick=()=>$('csvInput').click(); $('csvInput').onchange=()=>{if($('csvInput').files[0])loadCsv($('csvInput').files[0]);};
+Object.values(controls).forEach(el=>el.addEventListener('change',()=>{if(el===controls.sideCb)$('main').classList.toggle('showSide',controls.sideCb.checked); bestCache.key=''; draw();}));
+window.addEventListener('resize',draw);
+requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

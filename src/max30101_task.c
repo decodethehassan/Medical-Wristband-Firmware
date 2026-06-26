@@ -83,7 +83,11 @@ static const struct device *i2c_dev;
 static volatile uint8_t g_requested_ppg_channels = MAX30101_PPG_CH_DEFAULT;
 static uint8_t g_applied_ppg_channels = 0U;
 
+#if PPG_VALIDATION_MODE
+#define PPG_LED_CURRENT_DEFAULT PPG_VAL_LED_CURRENT
+#else
 #define PPG_LED_CURRENT_DEFAULT 0x28U
+#endif
 
 static int wr(uint8_t reg, uint8_t val)
 {
@@ -549,7 +553,6 @@ static void max30101_thread(void *a, void *b, void *c)
              */
 #if PPG_VALIDATION_MODE
             /* Validation mode keeps the algorithm input explicitly on real GREEN. */
-            uint32_t algo_ppg_signal = green;
             algo_v0_push_ppg(red, ir, green, raw_sample_t_ms);
 #else
             /* Existing Algo V0 processes the value passed in the IR argument.
